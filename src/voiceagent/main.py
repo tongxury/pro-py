@@ -120,7 +120,7 @@ def prewarm(proc: JobProcess):
 async def entrypoint(ctx: JobContext):
     logger.info(f"Entrypoint triggered for room: {ctx.room.name}")
     # Default to 'aura' persona
-    config = AGENTS.get("aura")
+    config = AGENTS.get("aura_zh")
     agent = AuraAgent(ctx, config)
     try:
         await agent.start()
