@@ -119,8 +119,57 @@ def prewarm(proc: JobProcess):
 
 async def entrypoint(ctx: JobContext):
     logger.info(f"Entrypoint triggered for room: {ctx.room.name}")
-    # Default to 'aura' persona
-    config = AGENTS.get("aura_zh")
+    
+    # --- 1. Read configuration from Room Metadata ---
+    # Since Go puts config in Room Metadata (Auto-Join strategy), we read it here.
+    dispatch_info = ctx.room.metadata
+    logger.info(f"Checking Room Metadata: {dispatch_info}")
+
+    target_agent_id = "aura_zh"
+    user_nickname = "User"
+    memory_context = ""
+
+    if dispatch_info:
+        try:
+            data = json.loads(dispatch_info)
+            # 1. Config override
+            if "agentName" in data and data["agentName"] in AGENTS:
+                target_agent_id = data["agentName"]
+                logger.info(f"Switching to requested agent: {target_agent_id}")
+            
+            # 2. Profile info
+            user_profile = data.get("userProfile", {})
+            user_nickname = user_profile.get("nickname", "User")
+            
+            # 3. Memories
+            memories = data.get("memories", [])
+            if memories:
+                memory_list_text = "\n".join([f"- {m}" for m in memories])
+                memory_context = f"""
+\n---
+User Context:
+Name: {user_nickname}
+
+Things you remember about this user (IMPORTANT):
+{memory_list_text}
+---
+"""
+        except Exception as e:
+            logger.error(f"Failed to parse metadata: {e}")
+
+    # --- 2. Initialize Agent ---
+    config = AGENTS.get(target_agent_id)
+    if not config:
+        config = AGENTS.get("aura_zh")
+
+    # Inject memory into system prompt
+    # We create a shallow copy of config to avoid modifying the global singleton
+    from dataclasses import replace
+    if memory_context:
+        new_prompt = config.system_prompt + memory_context
+        config = replace(config, system_prompt=new_prompt)
+        logger.info("Memory context injected into System Prompt.")
+
     agent = AuraAgent(ctx, config)
     try:
         await agent.start()
@@ -129,7 +178,11 @@ async def entrypoint(ctx: JobContext):
 
 
 def main():
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    cli.run_app(WorkerOptions(
+        entrypoint_fnc=entrypoint, 
+        prewarm_fnc=prewarm,
+        # agent_name="aura_zh"
+    ))
 
 
 if __name__ == "__main__":
