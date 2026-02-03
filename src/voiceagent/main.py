@@ -76,9 +76,11 @@ class AuraAgent:
         )
 
     async def start(self):
-        logger.info(f"Connecting to room: {self.ctx.room.name}...")
-        await self.ctx.connect()
-        logger.info(f"Connected to room: {self.ctx.room.name}")
+        # Check connection state before connecting
+        if self.ctx.room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED:
+             logger.info(f"Connecting to room: {self.ctx.room.name}...")
+             await self.ctx.connect()
+             logger.info(f"Connected to room: {self.ctx.room.name}")
         
         # Share available personas via attributes
         persona_list = [{"id": k, "name": v.name} for k, v in AGENTS.items()]
@@ -121,10 +123,16 @@ def prewarm(proc: JobProcess):
 async def entrypoint(ctx: JobContext):
     logger.info(f"Entrypoint triggered for room: {ctx.room.name}")
     
+    # --- 0. Connect FIRST to ensure Metadata is synced ---
+    logger.info("Connecting to room to fetch metadata...")
+    await ctx.connect()
+    
     # --- 1. Read configuration from Room Metadata ---
     # Since Go puts config in Room Metadata (Auto-Join strategy), we read it here.
     dispatch_info = ctx.room.metadata
     logger.info(f"Checking Room Metadata: {dispatch_info}")
+    
+    print("Checking Room Metadata: ", dispatch_info)
 
     target_agent_id = "aura_zh"
     user_nickname = "User"
@@ -182,6 +190,8 @@ Things you remember about this user (IMPORTANT):
             logger.warning("No userId found, skipping memory save.")
             return
 
+
+        print("chat_ctx: ", chat_ctx)
         # 1. Prepare conversation history for LLM
         # Handle ChatContext structure differences
         messages = []
