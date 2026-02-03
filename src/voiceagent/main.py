@@ -5,6 +5,7 @@ AURA Voice Agent - Main Entry Point (livekit-agents 1.3.12 API)
 import asyncio
 import json
 import os
+import aiohttp
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -128,10 +129,13 @@ async def entrypoint(ctx: JobContext):
     target_agent_id = "aura_zh"
     user_nickname = "User"
     memory_context = ""
+    user_id = None
 
     if dispatch_info:
         try:
             data = json.loads(dispatch_info)
+            user_id = data.get("userId")
+            
             # 1. Config override
             if "agentName" in data and data["agentName"] in AGENTS:
                 target_agent_id = data["agentName"]
@@ -171,6 +175,97 @@ Things you remember about this user (IMPORTANT):
         logger.info("Memory context injected into System Prompt.")
 
     agent = AuraAgent(ctx, config)
+
+    # --- Memory Saving Logic ---
+    async def save_new_memories(chat_ctx, uid):
+        if not uid:
+            logger.warning("No userId found, skipping memory save.")
+            return
+
+        # 1. Prepare conversation history for LLM
+        # Handle ChatContext structure differences
+        messages = []
+        if hasattr(chat_ctx, "messages"):
+            messages = chat_ctx.messages
+        elif isinstance(chat_ctx, list):
+            messages = chat_ctx
+        else:
+            # Try to iterate directly if it acts like a list
+            try:
+                messages = list(chat_ctx)
+            except:
+                logger.error(f"Unknown ChatContext type: {type(chat_ctx)} Dir: {dir(chat_ctx)}")
+                return
+
+        # Simple extraction: last 20 messages
+        history_text = ""
+        # Filter for user/assistant messages only
+        valid_msgs = [m for m in messages if hasattr(m, 'role') and hasattr(m, 'content')]
+        
+        for msg in valid_msgs[-20:]:  # Last 20 messages
+            role = "User" if msg.role == "user" else "Assistant"
+            if msg.content:
+                 history_text += f"{role}: {msg.content}\n"
+        
+        if not history_text.strip():
+            logger.info("Empty conversation history, skipping memory save.")
+            return
+
+        logger.info("Generating memory summary...")
+        try:
+            # We can use the same LLM client or create a lightweight one
+            # Assuming openai is installed and configured via env
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI()
+            
+            prompt = f"""
+            Analyze the following conversation and extract ONE key fact or preference about the user that is worth remembering for future interactions.
+            If there is nothing significant, return 'NONE'.
+            Keep it concise (under 20 words).
+            
+            Conversation:
+            {history_text}
+            
+            Key Fact:
+            """
+            
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=60
+            )
+            
+            fact = response.choices[0].message.content.strip()
+            
+            if fact and fact != "NONE":
+                logger.info(f"New Memory Discovered: {fact}")
+                
+                # 2. Call Go Backend to persist
+                async with aiohttp.ClientSession() as session:
+                    payload = {
+                        "type": "fact",
+                        "content": fact,
+                        "importance": 5,
+                        "userId": uid 
+                    }
+                    # Backend URL
+                    url = "https://api.veogo.cn/api/va/memories" 
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            logger.info("Memory saved successfully to backend.")
+                        else:
+                            logger.error(f"Failed to save memory. Status: {resp.status}, Body: {await resp.text()}")
+            else:
+                logger.info("No significant memory extracted.")
+
+        except Exception as e:
+            logger.error(f"Error during memory saving: {e}")
+
+    @ctx.room.on("disconnected")
+    def on_room_disconnect():
+        logger.info("Room disconnected. Triggering memory save...")
+        # Access messages from the agent instance's chat context
+        asyncio.create_task(save_new_memories(agent.chat_ctx, user_id))
     try:
         await agent.start()
     except Exception as e:
