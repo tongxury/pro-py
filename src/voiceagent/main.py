@@ -14,15 +14,25 @@ from livekit.agents import JobContext, JobProcess, WorkerOptions, cli, voice
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.log import logger
 from livekit.plugins import cartesia, openai, silero, deepgram
+from livekit.plugins import cartesia, openai, silero, deepgram
 
 from voiceagent.agents import AGENTS, AgentConfig
+from voiceagent.services.recorder import TranscriptRecorder
 
 load_dotenv()
 
 class AuraAgent:
-    def __init__(self, ctx: JobContext, config: AgentConfig):
+    def __init__(self, ctx: JobContext, config: AgentConfig, user_id: str = None, conversation_id: str = None):
         self.ctx = ctx
         self.config = config
+        self.user_id = user_id
+        self.conversation_id = conversation_id
+        
+        # Initialize Recorder Plugin
+        if user_id and conversation_id:
+            self.recorder = TranscriptRecorder(user_id, conversation_id, ctx.room.name)
+        else:
+            self.recorder = None
         
         # Initialize providers
         logger.info("Initializing AuraAgent providers...")
@@ -43,6 +53,10 @@ class AuraAgent:
             tts=self.tts,
             chat_ctx=self.chat_ctx,
         )
+        
+        # Hook into the agent's definition of user turn completion to log messages
+        # Ideally AuraAgent would inherit from voice.Agent, but composition is fine with this hook.
+        self.agent.on_user_turn_completed = self._on_user_turn_completed
 
     def _init_stt(self):
         dg_key = os.getenv("DEEPGRAM_API_KEY")
@@ -75,6 +89,26 @@ class AuraAgent:
             **kwargs
         )
 
+    def _get_text_content(self, item):
+        # Try attribute first if it exists
+        if hasattr(item, "text_content"):
+            return item.text_content
+        # Fallback to content field
+        c = getattr(item, "content", "")
+        if isinstance(c, list):
+            # Join string parts
+            return "\n".join([str(x) for x in c if isinstance(x, str)])
+        return str(c)
+
+    async def _on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage):
+        """Called when the user has finished speaking, and the LLM is about to respond"""
+        if new_message.role == "user":
+            content = self._get_text_content(new_message)
+            logger.info(f"📝 [History] User (via on_user_turn_completed): {content}")
+            # Use Recorder Plugin
+            if self.recorder:
+                asyncio.create_task(self.recorder.record("user", content))
+
     async def start(self):
         # Check connection state before connecting
         if self.ctx.room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED:
@@ -94,11 +128,42 @@ class AuraAgent:
         @session.on("agent_state_changed")
         def on_agent_state(event: voice.AgentStateChangedEvent):
             logger.info(f"Agent state changed: {event.old_state} -> {event.new_state}")
+            
+            async def _check_and_log_agent():
+                # Wait briefly for context to sync
+                await asyncio.sleep(0.5)
+                # CRITICAL FIX: Ensure we read from the agent's internal context which gets updated
+                items = self.agent.chat_ctx.items
+                if not items:
+                    return
+                # Find the last assistant message
+                target_item = None
+                for item in reversed(items):
+                    if item.type == "message" and item.role == "assistant":
+                        target_item = item
+                        break
+                
+                if target_item:
+                    content = self._get_text_content(target_item) or ""
+                    # Avoid duplicates
+                    if hasattr(self, "_last_agent_content") and self._last_agent_content == content:
+                        return
+                    
+                    self._last_agent_content = content
+                    logger.info(f"📝 [History] Agent: {content}")
+                    if self.recorder:
+                        await self.recorder.record("agent", content)
+
+            # Log when agent finishes speaking (speaking -> listening/thinking)
+            if event.old_state == "speaking":
+                asyncio.create_task(_check_and_log_agent())
 
         @session.on("user_state_changed")
         def on_user_state(event: voice.UserStateChangedEvent):
             logger.debug(f"User state changed: {event.old_state} -> {event.new_state}")
-            
+            # User messages are handled by _before_llm_cb, so we don't need logic here
+            pass
+
         @session.on("error")
         def on_error(event: voice.ErrorEvent):
             logger.error(f"Agent session error: {event.error} (from {event.source})")
@@ -143,6 +208,7 @@ async def entrypoint(ctx: JobContext):
         try:
             data = json.loads(dispatch_info)
             user_id = data.get("userId")
+            conversation_id = data.get("conversationId")
             
             # 1. Config override
             if "agentName" in data and data["agentName"] in AGENTS:
@@ -182,100 +248,8 @@ Things you remember about this user (IMPORTANT):
         config = replace(config, system_prompt=new_prompt)
         logger.info("Memory context injected into System Prompt.")
 
-    agent = AuraAgent(ctx, config)
+    agent = AuraAgent(ctx, config, user_id=user_id, conversation_id=conversation_id)
 
-    # --- Memory Saving Logic ---
-    async def save_new_memories(chat_ctx, uid):
-        if not uid:
-            logger.warning("No userId found, skipping memory save.")
-            return
-
-
-        print("chat_ctx: ", chat_ctx)
-        # 1. Prepare conversation history for LLM
-        # Handle ChatContext structure differences
-        messages = []
-        if hasattr(chat_ctx, "messages"):
-            messages = chat_ctx.messages
-        elif isinstance(chat_ctx, list):
-            messages = chat_ctx
-        else:
-            # Try to iterate directly if it acts like a list
-            try:
-                messages = list(chat_ctx)
-            except:
-                logger.error(f"Unknown ChatContext type: {type(chat_ctx)} Dir: {dir(chat_ctx)}")
-                return
-
-        # Simple extraction: last 20 messages
-        history_text = ""
-        # Filter for user/assistant messages only
-        valid_msgs = [m for m in messages if hasattr(m, 'role') and hasattr(m, 'content')]
-        
-        for msg in valid_msgs[-20:]:  # Last 20 messages
-            role = "User" if msg.role == "user" else "Assistant"
-            if msg.content:
-                 history_text += f"{role}: {msg.content}\n"
-        
-        if not history_text.strip():
-            logger.info("Empty conversation history, skipping memory save.")
-            return
-
-        logger.info("Generating memory summary...")
-        try:
-            # We can use the same LLM client or create a lightweight one
-            # Assuming openai is installed and configured via env
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI()
-            
-            prompt = f"""
-            Analyze the following conversation and extract ONE key fact or preference about the user that is worth remembering for future interactions.
-            If there is nothing significant, return 'NONE'.
-            Keep it concise (under 20 words).
-            
-            Conversation:
-            {history_text}
-            
-            Key Fact:
-            """
-            
-            response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=60
-            )
-            
-            fact = response.choices[0].message.content.strip()
-            
-            if fact and fact != "NONE":
-                logger.info(f"New Memory Discovered: {fact}")
-                
-                # 2. Call Go Backend to persist
-                async with aiohttp.ClientSession() as session:
-                    payload = {
-                        "type": "fact",
-                        "content": fact,
-                        "importance": 5,
-                        "userId": uid 
-                    }
-                    # Backend URL
-                    url = "https://api.veogo.cn/api/va/memories" 
-                    async with session.post(url, json=payload) as resp:
-                        if resp.status == 200:
-                            logger.info("Memory saved successfully to backend.")
-                        else:
-                            logger.error(f"Failed to save memory. Status: {resp.status}, Body: {await resp.text()}")
-            else:
-                logger.info("No significant memory extracted.")
-
-        except Exception as e:
-            logger.error(f"Error during memory saving: {e}")
-
-    @ctx.room.on("disconnected")
-    def on_room_disconnect():
-        logger.info("Room disconnected. Triggering memory save...")
-        # Access messages from the agent instance's chat context
-        asyncio.create_task(save_new_memories(agent.chat_ctx, user_id))
     try:
         await agent.start()
     except Exception as e:
