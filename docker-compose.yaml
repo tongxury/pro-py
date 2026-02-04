@@ -1,0 +1,5 @@
+services:
+  livekit:
+    image: usernx/voiceagent-py:test
+    restart: always
+    container_name: voiceagent_livekit

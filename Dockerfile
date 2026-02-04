@@ -10,9 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy project files
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
+COPY .env.prod .env
 
 # Install package
 RUN pip install --no-cache-dir -e .
 
 # Default command
-CMD ["voiceagent", "start"]
+CMD ["voiceagent", "dev"]
