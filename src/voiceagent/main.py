@@ -6,11 +6,9 @@ import asyncio
 import json
 import os
 import time
-import aiohttp
-from typing import Optional
+from typing import Optional, Any
 
 from dotenv import load_dotenv
-from livekit import rtc
 from livekit.agents import JobContext, JobProcess, WorkerOptions, cli, voice
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.log import logger
@@ -55,8 +53,9 @@ class AuraAgent:
         )
         
         # Hook into the agent's definition of user turn completion to log messages
-        # Ideally AuraAgent would inherit from voice.Agent, but composition is fine with this hook.
         self.agent.on_user_turn_completed = self._on_user_turn_completed
+        
+        self._last_agent_content = ""
 
     def _init_stt(self):
         dg_key = os.getenv("DEEPGRAM_API_KEY")
@@ -68,7 +67,6 @@ class AuraAgent:
 
     def _init_tts(self):
         # Fallback to OpenAI TTS if Cartesia is failing or key is problematic
-        # For debugging, we'll try OpenAI first if CARTESIA_API_KEY is missing or if we want to test
         use_openai = os.getenv("USE_OPENAI_TTS", "true").lower() == "true"
         
         if use_openai:
@@ -110,32 +108,41 @@ class AuraAgent:
                 asyncio.create_task(self.recorder.record("user", content))
 
     async def start(self):
-        # Share available personas via attributes
-        persona_list = [{"id": k, "name": v.name} for k, v in AGENTS.items()]
-        await self.ctx.room.local_participant.set_attributes({
-            "personas": json.dumps(persona_list)
-        })
-        
-    async def _broadcast_transcript(self, role: str, text: str):
-        """Send transcripts to participants via Data Channel"""
-        try:
-            payload = json.dumps({
-                "type": "transcript",
-                "role": role,
-                "text": text,
-                "timestamp": time.time()
-            })
-            await self.ctx.room.local_participant.publish_data(payload, reliable=True)
-        except Exception as e:
-            logger.error(f"Failed to broadcast transcript: {e}")
-
-    async def start(self):
         # Create and start the session
         session = voice.AgentSession()
         
         @session.on("agent_state_changed")
         def on_agent_state(event: voice.AgentStateChangedEvent):
             logger.info(f"Agent state changed: {event.old_state} -> {event.new_state}")
+            
+            async def _check_and_log_agent():
+                # Wait briefly for context to sync
+                await asyncio.sleep(0.5)
+                # CRITICAL: Ensure we read from the agent's internal context which gets updated
+                items = self.agent.chat_ctx.items
+                if not items:
+                    return
+                # Find the last assistant message
+                target_item = None
+                for item in reversed(items):
+                    if item.type == "message" and item.role == "assistant":
+                        target_item = item
+                        break
+                
+                if target_item:
+                    content = self._get_text_content(target_item) or ""
+                    # Avoid duplicates
+                    if hasattr(self, "_last_agent_content") and self._last_agent_content == content:
+                        return
+                    
+                    self._last_agent_content = content
+                    logger.info(f"📝 [History] Agent: {content}")
+                    if self.recorder:
+                        await self.recorder.record("agent", content)
+
+            # Log when agent finishes speaking (speaking -> listening/thinking)
+            if event.old_state == "speaking":
+                asyncio.create_task(_check_and_log_agent())
 
         @session.on("error")
         def on_error(event: voice.ErrorEvent):
