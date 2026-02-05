@@ -5,6 +5,7 @@ AURA Voice Agent - Main Entry Point (livekit-agents 1.3.12 API)
 import asyncio
 import json
 import os
+import time
 import aiohttp
 from typing import Optional
 
@@ -13,7 +14,6 @@ from livekit import rtc
 from livekit.agents import JobContext, JobProcess, WorkerOptions, cli, voice
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.log import logger
-from livekit.plugins import cartesia, openai, silero, deepgram
 from livekit.plugins import cartesia, openai, silero, deepgram
 
 from voiceagent.agents import AGENTS, AgentConfig
@@ -110,73 +110,44 @@ class AuraAgent:
                 asyncio.create_task(self.recorder.record("user", content))
 
     async def start(self):
-        # Check connection state before connecting
-        if self.ctx.room.connection_state == rtc.ConnectionState.CONN_DISCONNECTED:
-             logger.info(f"Connecting to room: {self.ctx.room.name}...")
-             await self.ctx.connect()
-             logger.info(f"Connected to room: {self.ctx.room.name}")
-        
         # Share available personas via attributes
         persona_list = [{"id": k, "name": v.name} for k, v in AGENTS.items()]
         await self.ctx.room.local_participant.set_attributes({
             "personas": json.dumps(persona_list)
         })
         
+    async def _broadcast_transcript(self, role: str, text: str):
+        """Send transcripts to participants via Data Channel"""
+        try:
+            payload = json.dumps({
+                "type": "transcript",
+                "role": role,
+                "text": text,
+                "timestamp": time.time()
+            })
+            await self.ctx.room.local_participant.publish_data(payload, reliable=True)
+        except Exception as e:
+            logger.error(f"Failed to broadcast transcript: {e}")
+
+    async def start(self):
         # Create and start the session
         session = voice.AgentSession()
         
         @session.on("agent_state_changed")
         def on_agent_state(event: voice.AgentStateChangedEvent):
             logger.info(f"Agent state changed: {event.old_state} -> {event.new_state}")
-            
-            async def _check_and_log_agent():
-                # Wait briefly for context to sync
-                await asyncio.sleep(0.5)
-                # CRITICAL FIX: Ensure we read from the agent's internal context which gets updated
-                items = self.agent.chat_ctx.items
-                if not items:
-                    return
-                # Find the last assistant message
-                target_item = None
-                for item in reversed(items):
-                    if item.type == "message" and item.role == "assistant":
-                        target_item = item
-                        break
-                
-                if target_item:
-                    content = self._get_text_content(target_item) or ""
-                    # Avoid duplicates
-                    if hasattr(self, "_last_agent_content") and self._last_agent_content == content:
-                        return
-                    
-                    self._last_agent_content = content
-                    logger.info(f"📝 [History] Agent: {content}")
-                    if self.recorder:
-                        await self.recorder.record("agent", content)
-
-            # Log when agent finishes speaking (speaking -> listening/thinking)
-            if event.old_state == "speaking":
-                asyncio.create_task(_check_and_log_agent())
-
-        @session.on("user_state_changed")
-        def on_user_state(event: voice.UserStateChangedEvent):
-            logger.debug(f"User state changed: {event.old_state} -> {event.new_state}")
-            # User messages are handled by _before_llm_cb, so we don't need logic here
-            pass
 
         @session.on("error")
         def on_error(event: voice.ErrorEvent):
-            logger.error(f"Agent session error: {event.error} (from {event.source})")
+            logger.error(f"Session Error: {event.error}")
 
-        # Start the agent session on the room
+        # Start the session
         logger.info("Starting Voice Agent Session...")
         await session.start(self.agent, room=self.ctx.room)
-        logger.info("AURA session active")
         
         # Initial greeting
         if self.config.greeting:
             await asyncio.sleep(1)
-            logger.info(f"Sending greeting: {self.config.greeting}")
             await session.say(self.config.greeting)
 
 
@@ -186,81 +157,85 @@ def prewarm(proc: JobProcess):
 
 
 async def entrypoint(ctx: JobContext):
-    logger.info(f"Entrypoint triggered for room: {ctx.room.name}")
-    
-    # --- 0. Connect FIRST to ensure Metadata is synced ---
-    logger.info("Connecting to room to fetch metadata...")
-    await ctx.connect()
-    
-    # --- 1. Read configuration from Room Metadata ---
-    # Since Go puts config in Room Metadata (Auto-Join strategy), we read it here.
-    dispatch_info = ctx.room.metadata
-    logger.info(f"Checking Room Metadata: {dispatch_info}")
-    
-    print("Checking Room Metadata: ", dispatch_info)
+    logger.info(f"Entrypoint triggered (Explicit Dispatch) for room: {ctx.room.name}")
 
+    # --- 0. Robust Connection with Timeout ---
+    max_connect_retries = 3
+    connected = False
+    for i in range(max_connect_retries):
+        try:
+            logger.info(f"Connecting to room (attempt {i+1}/{max_connect_retries})...")
+            await asyncio.wait_for(ctx.connect(), timeout=10.0)
+            logger.info(f"Successfully connected to room: {ctx.room.name}")
+            connected = True
+            break
+        except Exception as e:
+            logger.error(f"Connection attempt {i+1} failed: {e}")
+        if i < max_connect_retries - 1:
+            await asyncio.sleep(1.5)
+
+    if not connected:
+        return
+
+    # --- 1. Priority Data Strategy: Job Metadata vs Room Metadata ---
+    # In Explicit Dispatch mode, Go sends metadata DIRECTLY with the job.
+    # This is much faster and more reliable than waiting for room metadata.
+    dispatch_info = ctx.job.metadata or ctx.room.metadata
+    
+    if not dispatch_info or len(dispatch_info) < 10:
+        logger.info("Metadata not in job, waiting for room metadata sync...")
+        for i in range(5):
+            dispatch_info = ctx.room.metadata
+            if dispatch_info and len(dispatch_info) > 10:
+                break
+            await asyncio.sleep(0.5)
+
+    # --- 2. Process Configuration ---
     target_agent_id = "aura_zh"
     user_nickname = "User"
     memory_context = ""
     user_id = None
+    conversation_id = None
 
     if dispatch_info:
         try:
             data = json.loads(dispatch_info)
             user_id = data.get("userId")
             conversation_id = data.get("conversationId")
+            target_agent_id = data.get("agentName", target_agent_id)
             
-            # 1. Config override
-            if "agentName" in data and data["agentName"] in AGENTS:
-                target_agent_id = data["agentName"]
-                logger.info(f"Switching to requested agent: {target_agent_id}")
-            
-            # 2. Profile info
             user_profile = data.get("userProfile", {})
             user_nickname = user_profile.get("nickname", "User")
             
-            # 3. Memories
             memories = data.get("memories", [])
             if memories:
                 memory_list_text = "\n".join([f"- {m}" for m in memories])
-                memory_context = f"""
-\n---
-User Context:
-Name: {user_nickname}
-
-Things you remember about this user (IMPORTANT):
-{memory_list_text}
----
-"""
+                memory_context = f"\n---\nUser Context (Name: {user_nickname}):\n{memory_list_text}\n---\n"
         except Exception as e:
             logger.error(f"Failed to parse metadata: {e}")
 
-    # --- 2. Initialize Agent ---
-    config = AGENTS.get(target_agent_id)
-    if not config:
-        config = AGENTS.get("aura_zh")
+    # --- 3. Resolve and Prepare Agent ---
+    config = AGENTS.get(target_agent_id, AGENTS.get("aura_zh"))
 
-    # Inject memory into system prompt
-    # We create a shallow copy of config to avoid modifying the global singleton
     from dataclasses import replace
     if memory_context:
-        new_prompt = config.system_prompt + memory_context
-        config = replace(config, system_prompt=new_prompt)
-        logger.info("Memory context injected into System Prompt.")
+        config = replace(config, system_prompt=config.system_prompt + memory_context)
 
+    # --- 4. Start the Agent ---
     agent = AuraAgent(ctx, config, user_id=user_id, conversation_id=conversation_id)
-
+    
     try:
+        logger.info(f"Starting AURA ({target_agent_id}) for session {conversation_id or 'unknown'}...")
         await agent.start()
     except Exception as e:
-        logger.exception(f"Failed to start agent: {e}")
+        logger.exception(f"Critical error during agent startup: {e}")
 
 
 def main():
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint, 
         prewarm_fnc=prewarm,
-        # agent_name="aura_zh"
+        agent_name="aura_zh", # Enable Explicit Dispatch
     ))
 
 
