@@ -203,6 +203,7 @@ async def entrypoint(ctx: JobContext):
     memory_context = ""
     user_id = None
     conversation_id = None
+    topic = None
 
     if dispatch_info:
         try:
@@ -210,14 +211,16 @@ async def entrypoint(ctx: JobContext):
             user_id = data.get("userId")
             conversation_id = data.get("conversationId")
             target_agent_id = data.get("agentName", target_agent_id)
+            topic = data.get("topic")
+            topic_greeting = data.get("topicGreeting")
+            topic_instruction = data.get("topicInstruction")
             
-            user_profile = data.get("userProfile", {})
-            user_nickname = user_profile.get("nickname", "User")
+            user_nickname = data.get("nickname", "User")
             
             memories = data.get("memories", [])
             if memories:
                 memory_list_text = "\n".join([f"- {m}" for m in memories])
-                memory_context = f"\n---\nUser Context (Name: {user_nickname}):\n{memory_list_text}\n---\n"
+                memory_context = f"\n---\n[User Context & Memories]\nUser Name: {user_nickname}\nRelevant Memories:\n{memory_list_text}\n\nIMPORTANT: You MUST use the user's name ({user_nickname}) and their past memories to make the conversation feel warm, personal, and continuous. Do not be generic.\n---\n"
         except Exception as e:
             logger.error(f"Failed to parse metadata: {e}")
 
@@ -227,6 +230,24 @@ async def entrypoint(ctx: JobContext):
     from dataclasses import replace
     if memory_context:
         config = replace(config, system_prompt=config.system_prompt + memory_context)
+
+    # --- 3.1 Topic Customization ---
+    if topic:
+        # 1. Use greeting from metadata if available, and personalize it
+        if topic_greeting:
+             final_greeting = topic_greeting
+             # If nickname is available and valid, personalize the greeting
+             if user_nickname and user_nickname != "User":
+                 final_greeting = f"Hi {user_nickname}, {topic_greeting}"
+             
+             config = replace(config, greeting=final_greeting)
+        
+        # 2. Use instruction from metadata if available
+        if topic_instruction:
+             topic_instruction_text = f"\n\n[Current Topic Context]\nThe user has selected to talk about topic: '{topic}'.\nSpecial Instruction: {topic_instruction}\n\nTone Requirement: Be warm, empathetic, and intimate (make the user feel '亲切'). Start the conversation by acknowledging their situation or the topic gently."
+             config = replace(config, system_prompt=config.system_prompt + topic_instruction_text)
+        
+        logger.info(f"Applying topic customization for: {topic}. Greeting: {config.greeting}")
 
     # --- 4. Start the Agent ---
     agent = AuraAgent(ctx, config, user_id=user_id, conversation_id=conversation_id)
