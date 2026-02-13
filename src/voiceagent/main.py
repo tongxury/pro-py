@@ -14,7 +14,18 @@ from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.log import logger
 from livekit.plugins import cartesia, openai, silero, deepgram
 
-from voiceagent.agents import AGENTS, AgentConfig
+from dataclasses import dataclass, field
+
+@dataclass
+class AgentConfig:
+    name: str
+    system_prompt: str
+    greeting: str
+    voice: str
+    language: str
+    llm_model: str
+    tts_model: str
+
 from voiceagent.services.recorder import TranscriptRecorder
 
 load_dotenv()
@@ -74,17 +85,11 @@ class AuraAgent:
             return openai.TTS(model="tts-1", voice="alloy")
 
         logger.info(f"Using Cartesia TTS with voice: {self.config.voice}, model: {self.config.tts_model}")
-        kwargs = {}
-        if self.config.speed:
-            kwargs["speed"] = self.config.speed
-        if self.config.emotion:
-            kwargs["emotion"] = self.config.emotion
             
         return cartesia.TTS(
             model=self.config.tts_model,
             voice=self.config.voice,
             language=self.config.language,
-            **kwargs
         )
 
     def _get_text_content(self, item):
@@ -185,8 +190,6 @@ async def entrypoint(ctx: JobContext):
         return
 
     # --- 1. Priority Data Strategy: Job Metadata vs Room Metadata ---
-    # In Explicit Dispatch mode, Go sends metadata DIRECTLY with the job.
-    # This is much faster and more reliable than waiting for room metadata.
     dispatch_info = ctx.job.metadata or ctx.room.metadata
     
     if not dispatch_info or len(dispatch_info) < 10:
@@ -197,63 +200,44 @@ async def entrypoint(ctx: JobContext):
                 break
             await asyncio.sleep(0.5)
 
-    # --- 2. Process Configuration ---
-    target_agent_id = "aura_zh"
-    user_nickname = "User"
-    memory_context = ""
-    user_id = None
-    conversation_id = None
-    topic = None
-
+    # --- 2. Process Configuration from Metadata (Go Backend) ---
+    data = {}
     if dispatch_info:
         try:
             data = json.loads(dispatch_info)
-            user_id = data.get("userId")
-            conversation_id = data.get("conversationId")
-            target_agent_id = data.get("agentName", target_agent_id)
-            topic = data.get("topic")
-            topic_greeting = data.get("topicGreeting")
-            topic_instruction = data.get("topicInstruction")
-            
-            user_nickname = data.get("nickname", "User")
-            
-            memories = data.get("memories", [])
-            if memories:
-                memory_list_text = "\n".join([f"- {m}" for m in memories])
-                memory_context = f"\n---\n[User Context & Memories]\nUser Name: {user_nickname}\nRelevant Memories:\n{memory_list_text}\n\nIMPORTANT: You MUST use the user's name ({user_nickname}) and their past memories to make the conversation feel warm, personal, and continuous. Do not be generic.\n---\n"
         except Exception as e:
             logger.error(f"Failed to parse metadata: {e}")
 
-    # --- 3. Resolve and Prepare Agent ---
-    config = AGENTS.get(target_agent_id, AGENTS.get("aura_zh"))
+    # Extract with no defaults (or minimal structural defaults)
+    user_id = data.get("userId")
+    conversation_id = data.get("conversationId")
+    agent_name = data.get("agentName", "aura_zh")
+    
+    system_prompt = data.get("systemPrompt", "")
+    greeting = data.get("greeting", "")
+    # voice_id = data.get("voiceId", "")
+    voice_id = "a53c3509-ec3f-425c-a223-977f5f7424dd"
 
-    from dataclasses import replace
-    if memory_context:
-        config = replace(config, system_prompt=config.system_prompt + memory_context)
+    
+    logger.info(f"Received Configuration - SystemPrompt Length: {dispatch_info}")
+    print(dispatch_info)
 
-    # --- 3.1 Topic Customization ---
-    if topic:
-        # 1. Use greeting from metadata if available, and personalize it
-        if topic_greeting:
-             final_greeting = topic_greeting
-             # If nickname is available and valid, personalize the greeting
-             if user_nickname and user_nickname != "User":
-                 final_greeting = f"Hi {user_nickname}, {topic_greeting}"
-             
-             config = replace(config, greeting=final_greeting)
-        
-        # 2. Use instruction from metadata if available
-        if topic_instruction:
-             topic_instruction_text = f"\n\n[Current Topic Context]\nThe user has selected to talk about topic: '{topic}'.\nSpecial Instruction: {topic_instruction}\n\nTone Requirement: Be warm, empathetic, and intimate (make the user feel '亲切'). Start the conversation by acknowledging their situation or the topic gently."
-             config = replace(config, system_prompt=config.system_prompt + topic_instruction_text)
-        
-        logger.info(f"Applying topic customization for: {topic}. Greeting: {config.greeting}")
+    # --- 3. Initialize Agent Config ---
+    config = AgentConfig(
+        name=agent_name,
+        system_prompt=system_prompt,
+        greeting=greeting,
+        voice=voice_id,
+        language="zh" if "zh" in agent_name else "en",
+        llm_model="gpt-4o-mini",
+        tts_model="sonic-multilingual",
+    )
 
     # --- 4. Start the Agent ---
     agent = AuraAgent(ctx, config, user_id=user_id, conversation_id=conversation_id)
     
     try:
-        logger.info(f"Starting AURA ({target_agent_id}) for session {conversation_id or 'unknown'}...")
+        logger.info(f"Starting AURA ({agent_name}) for session {conversation_id or 'unknown'}...")
         await agent.start()
     except Exception as e:
         logger.exception(f"Critical error during agent startup: {e}")
