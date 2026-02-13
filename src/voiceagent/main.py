@@ -90,6 +90,8 @@ class AuraAgent:
             model=self.config.tts_model,
             voice=self.config.voice,
             language=self.config.language,
+            word_timestamps=False,
+            sample_rate=44100,
         )
 
     def _get_text_content(self, item):
@@ -215,12 +217,13 @@ async def entrypoint(ctx: JobContext):
     
     system_prompt = data.get("systemPrompt", "")
     greeting = data.get("greeting", "")
-    # voice_id = data.get("voiceId", "")
-    voice_id = "a53c3509-ec3f-425c-a223-977f5f7424dd"
-
+    voice_id = data.get("voiceId", "")
+    # voice_id = ""
     
-    logger.info(f"Received Configuration - SystemPrompt Length: {dispatch_info}")
-    print(dispatch_info)
+    use_openai_env = os.getenv("USE_OPENAI_TTS")
+    logger.info(f"DEBUG: USE_OPENAI_TTS={use_openai_env}, Active VoiceID={voice_id}")
+    
+    logger.info(f"Received Configuration - SystemPrompt Length: {len(system_prompt)}")
 
     # --- 3. Initialize Agent Config ---
     config = AgentConfig(
