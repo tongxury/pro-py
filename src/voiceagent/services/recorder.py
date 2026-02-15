@@ -7,14 +7,14 @@ class TranscriptRecorder:
         self._user_id = user_id
         self._conversation_id = conversation_id
         self._room_name = room_name
-        self._api_base_url = os.getenv("API_BASE_URL", "https://api.veogo.cn")
+        self._api_base_url = os.getenv("API_BASE_URL", "https://api.larksings.com")
         self._api_url = f"{self._api_base_url}/api/va/transcripts"
 
     async def record(self, role: str, content: str):
         """
         Send transcript entry to the backend.
         """
-        if not self._user_id or not self._conversation_id:
+        if not self._user_id or not self._conversation_id:  
             return
 
         payload = {
