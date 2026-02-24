@@ -1,5 +1,16 @@
 services:
-  livekit:
-    image: usernx/voiceagent-py:1.0.1
+  soulmate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: usernx/soulmate-py:1.0.1
     restart: always
-    container_name: voiceagent_livekit
+    container_name: soulmate
+
+  speakmate:
+    build:
+      context: .
+      dockerfile: Dockerfile-speakmate
+    image: usernx/speakmate-py:1.0.1
+    restart: always
+    container_name: speakmate

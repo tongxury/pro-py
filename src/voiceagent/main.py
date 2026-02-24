@@ -250,7 +250,7 @@ def main():
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint, 
         prewarm_fnc=prewarm,
-        agent_name="aura_zh", # Enable Explicit Dispatch
+        agent_name=os.getenv("AGENT_NAME", "aura_zh"), # Enable Explicit Dispatch
     ))
 
 
